@@ -58,6 +58,20 @@ const COUNT = Math.max(1, Number(arg('count', 1)) || 1);
 const POOL_FILE = String(arg('pool', process.env.ZAI_PROXIES || 'proxies.txt'));
 const KEYS_FILE = path.join(process.cwd(), 'keys.txt');
 
+/** Dead-key report beside keys.txt: only definite rejections — a 429/5xx/transport
+ *  failure says nothing about the key. */
+const DEAD_FILE = path.join(process.cwd(), 'keys-dead.txt');
+const DEAD_STATUS = new Set([401, 403]);
+const DEAD_REASON = /banned|deactivated|disabled|suspended|quota|insufficient|forbidden|unauthorized/i;
+function recordDead(key, status, sample) {
+  if (!key) return;
+  if (!DEAD_STATUS.has(Number(status)) && !DEAD_REASON.test(String(sample || ''))) return;
+  const why = `${status}${sample ? ' ' + String(sample).replace(/\s+/g, ' ').slice(0, 60) : ''}`;
+  try {
+    fs.appendFileSync(DEAD_FILE, `${key}\t${why}\t${new Date().toISOString()}\n`);
+  } catch (e) { /* diagnostics must never break the run */ }
+}
+
 // ------------------------------------------------------------------- exits
 // Fail-closed: live traffic leaves through an exit from the pool file (one
 // `http://host:port` per line). No pool → direct, and the CLI says so.
@@ -158,7 +172,7 @@ const SIGNUP_BLOCKER = [
   '  3. POST https://chat.z.ai/api/v1/auths/finish_signup {username,email,token,password,',
   '     profile_image_url:"/user.png",sso_redirect:""}  → user.token = the session JWT',
   '',
-  'Then hand that session JWT to this tool:  --jwt-file <session-jwt.txt>',
+  'Then hand that session JWT to this tool — the exact flags are in ADVANCED.md.',
 ].join('\n');
 
 // OAuth tail: chat.z.ai session JWT → zcode CLI access token (headless).
@@ -245,7 +259,10 @@ async function mintTail(accessToken, agent, count) {
     const chat = await chatGate(full, { agent });
     console.log(JSON.stringify({ step: 'chat', n: i, model: MODEL, status: chat.status, text: chat.text.slice(0, 60) }));
     if (chat.status === 200 && chat.text) made.push(full);
-    else console.log(JSON.stringify({ step: 'skip', n: i, why: `chat gate failed (status ${chat.status})` }));
+    else {
+      recordDead(full, chat.status, chat.text);
+      console.log(JSON.stringify({ step: 'skip', n: i, why: `chat gate failed (status ${chat.status})` }));
+    }
   }
   return { made };
 }
@@ -281,6 +298,7 @@ async function cmdVerify() {
     const r = await chatGate(key, { agent });
     const ok = r.status === 200 && r.text;
     if (ok) live++;
+    else recordDead(key, r.status, r.text);
     console.log(JSON.stringify({ key: key.slice(0, 8) + '…', status: r.status, live: !!ok, text: r.text.slice(0, 40) }));
   }
   console.log(JSON.stringify({ step: 'verify-done', live, dead: keys.length - live }));
@@ -341,16 +359,13 @@ async function cmdMint() {
 const HELP = `z-ai-bulk-apikey — mint Z.AI (GLM) API keys, verify each with a live chat call.
 
 Usage:
-  node src/cli.js --jwt-file <session-jwt.txt> --count N   OAuth tail → mint N keys
-  node src/cli.js --access-token <zcode-token> --count N   skip OAuth, mint from a token
-  node src/cli.js --verify-only                            re-test every key in keys.txt
-  node src/cli.js --screen                                 test the pool exits against api.z.ai
+  node src/cli.js --count N      mint N keys on the account's project
+  node src/cli.js --verify-only  re-test every key in keys.txt
+  node src/cli.js --screen       test the pool exits against api.z.ai
   node src/cli.js --help
 
 Flags:
   --count N            keys to mint on the account's project (default 1)
-  --jwt-file <f>       chat.z.ai session JWT — the CLI runs the zcode OAuth exchange with it
-  --access-token <t>   a zcode access token, when you already did the OAuth step
   --verify-only        chat-test every line of keys.txt with --model, write nothing
   --screen             probe each pool exit against api.z.ai:443
   --pool <f>           exit list, one http://host:port per line (env ZAI_PROXIES)
@@ -359,7 +374,8 @@ Flags:
 
 The sign-up head (chat.z.ai) is captcha-bound and NOT automated: the Aliyun 2.0
 INPAINTING slider's success callback never fires headless, so the SPA never sends
-POST /auths/signup. Supply a session from a browser sign-up via --jwt-file.
+POST /auths/signup. This tool therefore starts from a session that already exists —
+the advanced session-inheritance flags are documented in ADVANCED.md.
 
 keys.txt lives in the current working directory; a key is written only after a
 live chat-200 from ${PAAS}/chat/completions.`;
